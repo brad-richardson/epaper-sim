@@ -8,10 +8,13 @@
 #include "renderer.h"
 
 // ---------------------------------------------------------------------------
-// Display driver — include the Seeed reTerminal E10xx header.
-// Adjust the include path to match the installed library version.
+// Display driver — Seeed_GFX ePaper (Spectra 6 via JD79686B)
 // ---------------------------------------------------------------------------
-// #include <ReTerminal_E10xx.h>   // uncomment once library is installed
+#include "TFT_eSPI.h"
+
+#ifdef EPAPER_ENABLE
+EPaper *epaper = nullptr;
+#endif
 
 // ---------------------------------------------------------------------------
 // Display geometry and framebuffer
@@ -60,7 +63,7 @@ RTC_DATA_ATTR static uint8_t  rtc_grid_packed[RTC_GRID_PACKED_SIZE];
 #define DROPS_PER_FRAME     2000          // grains to drop per refresh cycle
 #define SLEEP_DURATION_US   30000000ULL   // 30 s deep sleep between refreshes
 #define NUM_SOURCES_MIN     1
-#define NUM_SOURCES_MAX     8
+#define NUM_SOURCES_MAX     1
 #define CIRCLE_RADIUS_FRAC  0.35f         // source circle radius as fraction of min(W,H)
 // Start a new generation after this many frames (~100 min at 30 s/frame).
 // Acts as a ceiling alongside the fill threshold so the display always
@@ -91,7 +94,7 @@ static void grid_pack()
             rtc_grid_packed[byte_idx] |= (v << shift);
     }
     if (clamped) {
-        Serial.println("[pack] WARN: grid not fully stable, clamped cells >= 4");
+        Serial0.println("[pack] WARN: grid not fully stable, clamped cells >= 4");
     }
 }
 
@@ -141,7 +144,7 @@ static void new_generation()
     renderer_get_palette(rtc_source_color, n_sources);
     rtc_frame = 0;
 
-    Serial.printf("[lifecycle] new generation started: %d sources\n", n_sources);
+    Serial0.printf("[lifecycle] new generation started: %d sources\n", n_sources);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,23 +186,51 @@ static void drop_and_topple()
 // ---------------------------------------------------------------------------
 // Render the framebuffer and push it to the display
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Map our Spectra 6 indices to the colour constants defined by Seeed_GFX.
+// The library uses TFT_xxx constants; these map to the 6-colour palette.
+// ---------------------------------------------------------------------------
+static uint16_t spectra6_to_gfx(uint8_t idx)
+{
+    switch (idx) {
+        case SPECTRA6_BLACK:  return TFT_BLACK;
+        case SPECTRA6_WHITE:  return TFT_WHITE;
+        case SPECTRA6_GREEN:  return TFT_GREEN;
+        case SPECTRA6_BLUE:   return TFT_BLUE;
+        case SPECTRA6_RED:    return TFT_RED;
+        case SPECTRA6_YELLOW: return TFT_YELLOW;
+        default:              return TFT_WHITE;
+    }
+}
+
 static void push_display()
 {
     renderer_render(framebuf, (int)FRAMEBUF_SIZE, uf_parent, n_sources);
 
-    // Push to the Seeed E10xx display driver once the library is integrated:
-    //
-    //   epaper.writeBuffer(framebuf, FRAMEBUF_SIZE);
-    //   epaper.refresh();   // starts the ~15-30 s waveform refresh
-    //
-    // IMPORTANT: wait for the display's BUSY pin to deassert (or for the
-    // driver's completion callback) before calling esp_deep_sleep_start().
-    // Sleeping while the waveform is still running will corrupt the image.
-    // Example (adjust pin / API to match the actual driver):
-    //
-    //   while (digitalRead(EPAPER_BUSY_PIN) == HIGH) delay(10);
-    //
-    Serial.printf("[frame %lu] sources=%d fill=%.1f%%\n",
+#ifdef EPAPER_ENABLE
+    if (epaper) {
+        // Write our packed framebuffer to the EPaper sprite pixel-by-pixel.
+        // Each byte holds two 4-bit Spectra 6 colour indices (upper nibble = even
+        // pixel, lower nibble = odd pixel).
+        for (int dy = 0; dy < DISP_H; dy++) {
+            for (int dx = 0; dx < DISP_W; dx++) {
+                int byte_idx = (dy * DISP_W + dx) / 2;
+                uint8_t nibble;
+                if ((dx & 1) == 0) {
+                    nibble = (framebuf[byte_idx] >> 4) & 0x0F;
+                } else {
+                    nibble = framebuf[byte_idx] & 0x0F;
+                }
+                epaper->drawPixel(dx, dy, spectra6_to_gfx(nibble));
+            }
+        }
+
+        // Flush the sprite to the display — triggers the e-ink waveform refresh
+        epaper->update();
+    }
+#endif
+
+    Serial0.printf("[frame %lu] sources=%d fill=%.1f%%\n",
                   (unsigned long)rtc_frame,
                   n_sources,
                   sandpile_fill_percent() * 100.0f);
@@ -210,7 +241,24 @@ static void push_display()
 // ---------------------------------------------------------------------------
 void setup()
 {
-    Serial.begin(115200);
+    Serial0.begin(115200);
+    delay(500); // give USB-CDC time to connect
+    Serial0.println("[boot] firmware starting...");
+
+#ifdef EPAPER_ENABLE
+    Serial0.printf("[display] PSRAM: %s, free heap: %lu, free PSRAM: %lu\n",
+                   psramFound() ? "yes" : "no",
+                   (unsigned long)ESP.getFreeHeap(),
+                   (unsigned long)ESP.getFreePsram());
+    Serial0.println("[display] creating EPaper object...");
+    epaper = new EPaper();
+    Serial0.printf("[display] sprite created: %s\n", epaper->created() ? "yes" : "NO — display will not work!");
+    Serial0.println("[display] calling epaper->begin()...");
+    epaper->begin();
+    Serial0.println("[display] EPaper initialised");
+#else
+    Serial0.println("[display] EPAPER_ENABLE not defined, display disabled");
+#endif
 
     // TODO: configure a GPIO wakeup source so a button press forces a reseed.
     // Example:
@@ -241,7 +289,7 @@ void loop()
     // Start a new generation if the grid is saturated or we've been running long enough
     if (rtc_frame >= MAX_FRAMES_PER_GENERATION
             || sandpile_fill_percent() > FILL_THRESHOLD) {
-        Serial.println("[lifecycle] generation reset triggered");
+        Serial0.println("[lifecycle] generation reset triggered");
         // XOR-mix the existing seed with fresh hardware entropy so each
         // generation starts from a visually distinct random state.
         rtc_seed ^= esp_random();
@@ -270,8 +318,8 @@ void loop()
 
     // 6. Deep sleep until the next refresh cycle.
     //    The ePaper display holds its image with zero power draw during sleep.
-    Serial.printf("[sleep] deep sleep for %llu ms\n", SLEEP_DURATION_US / 1000ULL);
-    Serial.flush();
+    Serial0.printf("[sleep] deep sleep for %llu ms\n", SLEEP_DURATION_US / 1000ULL);
+    Serial0.flush();
     esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
     esp_deep_sleep_start();
 

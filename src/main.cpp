@@ -48,13 +48,15 @@ RTC_DATA_ATTR static uint8_t  rtc_gol_grid[GOL_GRID_BYTES];
 #define GOL_STALE_DEPTH 4
 RTC_DATA_ATTR static uint32_t rtc_hashes[GOL_STALE_DEPTH];
 RTC_DATA_ATTR static uint8_t  rtc_hash_idx = 0;
+RTC_DATA_ATTR static uint8_t  rtc_hash_count = 0; // entries recorded so far
 
 // ---------------------------------------------------------------------------
 // GoL tunables
 // ---------------------------------------------------------------------------
 #define GOL_SEED_DENSITY      0.37f
-#define GOL_SLEEP_DURATION_US 15000000ULL  // 15 s between frames
-#define GOL_MAX_FRAMES        2000         // reseed ceiling (~8 hrs at 15s)
+#define GOL_SLEEP_DURATION_US 30000000ULL  // 30 s between frames
+#define GOL_STEPS_PER_FRAME   20           // generations per display refresh
+#define GOL_MAX_FRAMES        1000         // reseed ceiling (~8 hrs at 30s)
 
 // ---------------------------------------------------------------------------
 static void gol_new_generation()
@@ -64,6 +66,7 @@ static void gol_new_generation()
     rtc_frame = 0;
     memset(rtc_hashes, 0, sizeof(rtc_hashes));
     rtc_hash_idx = 0;
+    rtc_hash_count = 0;
     Serial0.printf("[lifecycle] new GoL generation seeded (%lu alive)\n",
                    (unsigned long)gol_population());
 }
@@ -78,12 +81,14 @@ static bool gol_is_stale()
     if (gol_population() == 0) return true;
 
     uint32_t h = gol_hash();
-    for (int i = 0; i < GOL_STALE_DEPTH; i++) {
+    int entries = (rtc_hash_count < GOL_STALE_DEPTH) ? rtc_hash_count : GOL_STALE_DEPTH;
+    for (int i = 0; i < entries; i++) {
         if (rtc_hashes[i] == h) return true;
     }
     // Store current hash in ring buffer
     rtc_hashes[rtc_hash_idx] = h;
     rtc_hash_idx = (rtc_hash_idx + 1) % GOL_STALE_DEPTH;
+    if (rtc_hash_count < GOL_STALE_DEPTH) rtc_hash_count++;
     return false;
 }
 
@@ -151,8 +156,10 @@ void loop()
         gol_new_generation();
     }
 
-    // Advance one generation
-    gol_step();
+    // Advance multiple generations per display refresh
+    for (int s = 0; s < GOL_STEPS_PER_FRAME; s++) {
+        gol_step();
+    }
 
     // Persist grid to RTC
     memcpy(rtc_gol_grid, gol_grid, GOL_GRID_BYTES);

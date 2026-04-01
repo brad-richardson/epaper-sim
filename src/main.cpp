@@ -34,9 +34,14 @@ static uint8_t framebuf[FRAMEBUF_SIZE];
 #endif
 
 // ---------------------------------------------------------------------------
-// RTC memory — survives deep sleep.  The grid itself (28.8 KB) is too large
-// for RTC and is not persisted; it starts fresh each wake cycle.
+// RTC memory — survives deep sleep.
+//
+// The full grid (uint16_t, 28.8 KB) is too large for RTC, but after toppling
+// every cell is in [0, 3], so we pack 4 cells per byte (2 bits each).
+// 120×120 / 4 = 3600 bytes — fits comfortably in ESP32-S3 RTC slow memory.
 // ---------------------------------------------------------------------------
+#define RTC_GRID_PACKED_SIZE ((GRID_W * GRID_H + 3) / 4)
+
 RTC_DATA_ATTR static uint32_t rtc_seed      = 0;  // persistent RNG seed
 RTC_DATA_ATTR static uint32_t rtc_frame     = 0;  // frames rendered this generation
 RTC_DATA_ATTR static int      rtc_n_sources = 0;
@@ -46,6 +51,7 @@ RTC_DATA_ATTR static int      rtc_uf_rank[MAX_SOURCES];
 // Palette persisted so colours are stable across every deep-sleep/wake cycle
 RTC_DATA_ATTR static uint8_t  rtc_source_color[MAX_SOURCES];
 RTC_DATA_ATTR static bool     rtc_valid = false; // set true once first frame is done
+RTC_DATA_ATTR static uint8_t  rtc_grid_packed[RTC_GRID_PACKED_SIZE];
 
 // ---------------------------------------------------------------------------
 // Lifecycle tunables
@@ -57,9 +63,35 @@ RTC_DATA_ATTR static bool     rtc_valid = false; // set true once first frame is
 #define NUM_SOURCES_MAX     8
 #define CIRCLE_RADIUS_FRAC  0.35f         // source circle radius as fraction of min(W,H)
 // Start a new generation after this many frames (~100 min at 30 s/frame).
-// Without grid persistence the fill threshold alone cannot trigger a reset,
-// so this ensures the display cycles through different source configurations.
+// Acts as a ceiling alongside the fill threshold so the display always
+// cycles through different source configurations eventually.
 #define MAX_FRAMES_PER_GENERATION 200
+
+// ---------------------------------------------------------------------------
+// Pack / unpack the grid into 2-bit-per-cell RTC storage.
+// After toppling, all cell values are in [0, 3]; values >= 4 are clamped.
+// ---------------------------------------------------------------------------
+static void grid_pack()
+{
+    for (int i = 0; i < GRID_W * GRID_H; i++) {
+        uint8_t v = (grid[i] < 4) ? (uint8_t)grid[i] : 3;
+        int byte_idx = i / 4;
+        int shift    = (i % 4) * 2;
+        if (shift == 0)
+            rtc_grid_packed[byte_idx] = v;
+        else
+            rtc_grid_packed[byte_idx] |= (v << shift);
+    }
+}
+
+static void grid_unpack()
+{
+    for (int i = 0; i < GRID_W * GRID_H; i++) {
+        int byte_idx = i / 4;
+        int shift    = (i % 4) * 2;
+        grid[i] = (rtc_grid_packed[byte_idx] >> shift) & 0x03;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Active generation state (mirrors the RTC copies for in-loop convenience)
@@ -183,10 +215,9 @@ void setup()
     randomSeed(rtc_seed + rtc_frame);
 
     if (rtc_valid) {
-        // Waking from deep sleep -- restore generation metadata from RTC;
-        // the grid starts empty (not persisted across sleep).
+        // Waking from deep sleep -- restore generation metadata and grid
         generation_restore();
-        sandpile_reset();
+        grid_unpack();
     } else {
         // True first boot -- start fresh
         new_generation();
@@ -223,7 +254,10 @@ void loop()
     push_display();
     rtc_frame++;
 
-    // 5. Deep sleep until the next refresh cycle.
+    // 5. Pack grid into RTC memory so it survives deep sleep (3600 bytes)
+    grid_pack();
+
+    // 6. Deep sleep until the next refresh cycle.
     //    The ePaper display holds its image with zero power draw during sleep.
     Serial.printf("[sleep] deep sleep for %llu ms\n", SLEEP_DURATION_US / 1000ULL);
     Serial.flush();
